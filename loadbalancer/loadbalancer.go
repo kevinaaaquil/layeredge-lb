@@ -31,13 +31,13 @@ const (
 	// Redis key prefix for pending responses
 	pendingCacheKeyPrefix = "pending_response:"
 	// Default cache expiration time
-	defaultCacheExpiration = 1 * time.Hour
+	defaultCacheExpiration = 30 * time.Minute
 	// Placeholder response message
 	placeholderResponse = `{"status":"pending","message":"Your request is being processed"}`
 	// How often to check for a real response when waiting
 	cacheCheckInterval = 100 * time.Millisecond
 	// Maximum time to wait for a real response
-	maxWaitTime = 30 * time.Second
+	maxWaitTime = 30 * time.Minute
 )
 
 // WebhookPayload represents the payload to send to the webhook
@@ -69,6 +69,9 @@ func NewLoadBalancer(redisAddr, redisPassword string, redisDB int, timeout time.
 	if err != nil {
 		return nil, err
 	}
+
+	// flush all keys
+	client.FlushAll(ctx).Result()
 
 	if cacheExpiration == 0 {
 		cacheExpiration = defaultCacheExpiration
