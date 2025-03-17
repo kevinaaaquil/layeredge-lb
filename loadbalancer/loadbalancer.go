@@ -6,12 +6,15 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -25,9 +28,22 @@ const (
 	inUseIPsKey = "in_use_ips"
 	// Redis key prefix for cached responses
 	cacheKeyPrefix = "response_cache:"
+	// Redis key prefix for pending responses
+	pendingCacheKeyPrefix = "pending_response:"
 	// Default cache expiration time
-	defaultCacheExpiration = 30 * time.Minute
+	defaultCacheExpiration = 1 * time.Hour
+	// Placeholder response message
+	placeholderResponse = `{"status":"pending","message":"Your request is being processed"}`
+	// How often to check for a real response when waiting
+	cacheCheckInterval = 100 * time.Millisecond
+	// Maximum time to wait for a real response
+	maxWaitTime = 30 * time.Second
 )
+
+// WebhookPayload represents the payload to send to the webhook
+type WebhookPayload struct {
+	Text string `json:"text"`
+}
 
 // LoadBalancer represents a Redis-backed round-robin load balancer
 type LoadBalancer struct {
@@ -36,6 +52,7 @@ type LoadBalancer struct {
 	timeout         time.Duration
 	cacheEnabled    bool
 	cacheExpiration time.Duration
+	pendingRequests sync.Map // Track requests that are being processed
 }
 
 // NewLoadBalancer creates a new load balancer instance
@@ -104,6 +121,47 @@ func (lb *LoadBalancer) getNextAvailableIP(ctx context.Context) (string, error) 
 	return ip, nil
 }
 
+// waitForAvailableIP waits for an available IP with a backoff strategy
+func (lb *LoadBalancer) waitForAvailableIP(ctx context.Context) (string, error) {
+	// Initial wait time
+	waitTime := 100 * time.Millisecond
+	maxWaitTime := 5 * time.Second
+
+	for {
+		// Check if context is cancelled
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		default:
+			// Try to get an IP
+			ip, err := lb.getNextAvailableIP(ctx)
+			if err == nil {
+				return ip, nil
+			}
+
+			// If error is not "no available IPs", return the error
+			if !errors.Is(err, redis.Nil) && err.Error() != "no available IPs" {
+				return "", err
+			}
+
+			// Log that we're waiting
+			log.Printf("No IPs available, waiting %v before retry", waitTime)
+
+			// Wait with exponential backoff
+			select {
+			case <-time.After(waitTime):
+				// Increase wait time for next iteration (with a cap)
+				waitTime = time.Duration(float64(waitTime) * 1.5)
+				if waitTime > maxWaitTime {
+					waitTime = maxWaitTime
+				}
+			case <-ctx.Done():
+				return "", ctx.Err()
+			}
+		}
+	}
+}
+
 // releaseIP returns an IP to the available pool
 func (lb *LoadBalancer) releaseIP(ctx context.Context, ip string) error {
 	pipe := lb.redisClient.Pipeline()
@@ -111,6 +169,80 @@ func (lb *LoadBalancer) releaseIP(ctx context.Context, ip string) error {
 	pipe.SAdd(ctx, availableIPsKey, ip)
 	_, err := pipe.Exec(ctx)
 	return err
+}
+
+// getCacheKey generates a cache key from request data
+func getCacheKeyFromData(data interface{}) (string, error) {
+	dataBytes, err := json.Marshal(data)
+	if err != nil {
+		return "", err
+	}
+	return cacheKeyPrefix + string(dataBytes), nil
+}
+
+// getPendingCacheKey generates a pending cache key from request data
+func getPendingCacheKeyFromData(data interface{}) (string, error) {
+	dataBytes, err := json.Marshal(data)
+	if err != nil {
+		return "", err
+	}
+	return pendingCacheKeyPrefix + string(dataBytes), nil
+}
+
+// sendWebhook sends a notification to the webhook URL
+func (lb *LoadBalancer) sendWebhook(ip string, errMsg string) {
+	webhookURL := "https://hooks.slack.com/services/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" // Webhook URL
+
+	// Create the payload
+	payload := WebhookPayload{
+		Text: fmt.Sprintf("Connection refused to IP %s", ip),
+	}
+
+	// Convert payload to JSON
+	jsonPayload, err := json.Marshal(payload)
+	if err != nil {
+		log.Printf("Error creating webhook payload: %v", err)
+		return
+	}
+
+	// Create the request
+	req, err := http.NewRequest("POST", webhookURL, bytes.NewBuffer(jsonPayload))
+	if err != nil {
+		log.Printf("Error creating webhook request: %v", err)
+		return
+	}
+
+	// Set headers
+	req.Header.Set("Content-Type", "application/json")
+
+	// Send the request
+	client := &http.Client{
+		Timeout: 5 * time.Second, // Set a timeout for the webhook call
+	}
+
+	// Send the request in a goroutine to not block the main flow
+	go func() {
+		resp, err := client.Do(req)
+		if err != nil {
+			log.Printf("Error sending webhook: %v", err)
+			return
+		}
+		defer resp.Body.Close()
+
+		// Log the response status
+		log.Printf("Webhook sent, status: %s", resp.Status)
+
+		// Read and log response body for debugging
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			log.Printf("Error reading webhook response: %v", err)
+			return
+		}
+
+		if len(body) > 0 {
+			log.Printf("Webhook response: %s", string(body))
+		}
+	}()
 }
 
 // ServeHTTP implements the http.Handler interface to handle load balancing
@@ -134,33 +266,106 @@ func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		var requestData map[string]interface{}
 		if err := json.Unmarshal(bodyBytes, &requestData); err == nil {
 			if data, ok := requestData["data"]; ok {
-				// Create a cache key from the data field
-				dataBytes, err := json.Marshal(data)
-				if err == nil {
-					cacheKey := cacheKeyPrefix + string(dataBytes)
-
-					// Check if we have a cached response
-					cachedResponse, err := lb.redisClient.Get(ctx, cacheKey).Bytes()
-					if err == nil && len(cachedResponse) > 0 {
-						// We have a cached response, return it
-						w.Header().Set("Content-Type", "application/json")
-						w.Header().Set("X-Cache", "HIT")
-						w.Write(cachedResponse)
-						return
-					}
-
-					// No cached response, proceed with proxying but capture the response
-					responseCapture := &responseCapturer{
-						ResponseWriter: w,
-						cacheKey:       cacheKey,
-						lb:             lb,
-						ctx:            ctx,
-					}
-
-					// Continue with normal proxy handling but use our capturing writer
-					lb.handleProxy(responseCapture, r)
+				// Create cache keys
+				cacheKey, err := getCacheKeyFromData(data)
+				if err != nil {
+					log.Printf("Error creating cache key: %v", err)
+					lb.handleProxy(w, r) // Fall back to normal proxy
 					return
 				}
+
+				pendingCacheKey, err := getPendingCacheKeyFromData(data)
+				if err != nil {
+					log.Printf("Error creating pending cache key: %v", err)
+					lb.handleProxy(w, r) // Fall back to normal proxy
+					return
+				}
+
+				// Check if we have a cached response
+				cachedResponse, err := lb.redisClient.Get(ctx, cacheKey).Bytes()
+				if err == nil && len(cachedResponse) > 0 {
+					// We have a cached response, return it
+					log.Printf("Cache hit for key: %s", cacheKey)
+					w.Header().Set("Content-Type", "application/json")
+					w.Header().Set("X-Cache", "HIT")
+					w.Write(cachedResponse)
+					return
+				}
+
+				// Check if this request is already being processed
+				pendingExists, err := lb.redisClient.Exists(ctx, pendingCacheKey).Result()
+				if err == nil && pendingExists > 0 {
+					// This request is already being processed
+					log.Printf("Request for data is pending, waiting for real response")
+
+					// Set up a timeout context for the wait
+					waitCtx, cancel := context.WithTimeout(ctx, maxWaitTime)
+					defer cancel()
+
+					// Set up a ticker to periodically check for the real response
+					ticker := time.NewTicker(cacheCheckInterval)
+					defer ticker.Stop()
+
+					// Wait for either the real response or timeout
+					for {
+						select {
+						case <-ticker.C:
+							// Check if the real response is now available
+							cachedResponse, err := lb.redisClient.Get(waitCtx, cacheKey).Bytes()
+							if err == nil && len(cachedResponse) > 0 {
+								// We have a real response now, return it
+								log.Printf("Found cached response while waiting")
+								w.Header().Set("Content-Type", "application/json")
+								w.Header().Set("X-Cache", "WAIT-HIT")
+								w.Write(cachedResponse)
+								return
+							}
+
+							// Check if the pending key still exists
+							pendingExists, err := lb.redisClient.Exists(waitCtx, pendingCacheKey).Result()
+							if err != nil || pendingExists == 0 {
+								// The pending key is gone but no real response is available
+								// This is an error condition - the original request failed
+								log.Printf("Pending key disappeared without a real response")
+								http.Error(w, "Request processing failed", http.StatusInternalServerError)
+								return
+							}
+
+						case <-waitCtx.Done():
+							// We've waited too long, give up
+							log.Printf("Timeout waiting for real response after %v", maxWaitTime)
+							http.Error(w, "Timeout waiting for response", http.StatusGatewayTimeout)
+							return
+
+						case <-r.Context().Done():
+							// The client disconnected
+							log.Printf("Client disconnected while waiting for response")
+							return
+						}
+					}
+				}
+
+				// This is a new request, store a placeholder in Redis
+				log.Printf("Setting pending cache key: %s", pendingCacheKey)
+				err = lb.redisClient.Set(ctx, pendingCacheKey, []byte(placeholderResponse), lb.cacheExpiration).Err()
+				if err != nil {
+					log.Printf("Error setting pending cache: %v", err)
+					// Continue with proxy even if caching fails
+				}
+
+				// Create a response capturer to update the cache with the real response
+				responseCapture := &responseCapturer{
+					ResponseWriter:  w,
+					cacheKey:        cacheKey,
+					pendingCacheKey: pendingCacheKey,
+					lb:              lb,
+					ctx:             ctx,
+				}
+
+				// Continue with normal proxy handling but use our capturing writer
+				log.Printf("Proceeding with proxy using response capturer")
+				lb.handleProxy(responseCapture, r)
+				return
 			}
 		}
 
@@ -172,123 +377,203 @@ func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	lb.handleProxy(w, r)
 }
 
-// handleProxy handles the actual proxying logic
 func (lb *LoadBalancer) handleProxy(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	// Get the next available IP
-	ip, err := lb.getNextAvailableIP(ctx)
-	if err != nil {
-		http.Error(w, "No available servers", http.StatusServiceUnavailable)
-		log.Printf("Error getting available IP: %v", err)
-		return
-	}
+	// Keep track of the last error
+	var lastErr error
 
-	// Create a URL from the IP
-	targetURL, err := url.Parse("http://" + ip)
-	if err != nil {
-		lb.releaseIP(ctx, ip)
-		http.Error(w, "Invalid server address", http.StatusInternalServerError)
-		log.Printf("Error parsing URL for IP %s: %v", ip, err)
-		return
-	}
-
-	// Create a reverse proxy
-	proxy := httputil.NewSingleHostReverseProxy(targetURL)
-
-	// Set up a custom director to modify the request
-	originalDirector := proxy.Director
-	proxy.Director = func(req *http.Request) {
-		originalDirector(req)
-		req.Host = targetURL.Host
-	}
-
-	// Set up error handler
-	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
-		lb.releaseIP(ctx, ip)
-		http.Error(w, "Server error", http.StatusBadGateway)
-		log.Printf("Proxy error for IP %s: %v", ip, err)
-	}
-
-	// Set up a custom response writer that will release the IP when done
-	responseWriter := &responseWriterWithCallback{
-		ResponseWriter: w,
-		callback: func() {
-			// Release the IP when the response is complete
-			if err := lb.releaseIP(ctx, ip); err != nil {
-				log.Printf("Error releasing IP %s: %v", ip, err)
+	// Try to find a working IP - infinite loop until success or context cancellation
+	for {
+		// Check if the context is already done (client disconnected or timeout)
+		select {
+		case <-ctx.Done():
+			if lastErr != nil {
+				http.Error(w, "Request cancelled: "+lastErr.Error(), http.StatusGatewayTimeout)
+			} else {
+				http.Error(w, "Request cancelled", http.StatusGatewayTimeout)
 			}
-		},
-	}
+			log.Printf("Request context cancelled: %v", ctx.Err())
+			return
+		default:
+			// Continue with the request
+		}
 
-	// Set up a timeout for the request
-	if lb.timeout > 0 {
-		requestCtx, cancel := context.WithTimeout(ctx, lb.timeout)
-		defer cancel()
-		r = r.WithContext(requestCtx)
-	}
-
-	// Forward the request to the target server
-	proxy.ServeHTTP(responseWriter, r)
-}
-
-// responseCapturer captures the response to cache it
-type responseCapturer struct {
-	http.ResponseWriter
-	cacheKey string
-	lb       *LoadBalancer
-	ctx      context.Context
-	buffer   bytes.Buffer
-	status   int
-	headers  http.Header
-}
-
-func (rc *responseCapturer) WriteHeader(statusCode int) {
-	rc.status = statusCode
-	rc.ResponseWriter.WriteHeader(statusCode)
-}
-
-func (rc *responseCapturer) Write(b []byte) (int, error) {
-	// Only cache successful responses
-	if rc.status == 0 || rc.status == http.StatusOK {
-		rc.buffer.Write(b)
-	}
-	return rc.ResponseWriter.Write(b)
-}
-
-func (rc *responseCapturer) Flush() {
-	if flusher, ok := rc.ResponseWriter.(http.Flusher); ok {
-		flusher.Flush()
-	}
-}
-
-func (rc *responseCapturer) Hijack() (net.Conn, *bufio.ReadWriter, error) {
-	if hj, ok := rc.ResponseWriter.(http.Hijacker); ok {
-		return hj.Hijack()
-	}
-	return nil, nil, errors.New("hijacking not supported")
-}
-
-func (rc *responseCapturer) Finalize() {
-	// Cache the response if it was successful
-	if (rc.status == 0 || rc.status == http.StatusOK) && rc.buffer.Len() > 0 {
-		// Store the response in Redis
-		err := rc.lb.redisClient.Set(
-			rc.ctx,
-			rc.cacheKey,
-			rc.buffer.Bytes(),
-			rc.lb.cacheExpiration,
-		).Err()
-
+		// Get the next available IP, waiting if necessary
+		ip, err := lb.waitForAvailableIP(ctx)
 		if err != nil {
-			log.Printf("Error caching response: %v", err)
+			http.Error(w, "Failed to get available server: "+err.Error(), http.StatusServiceUnavailable)
+			log.Printf("Error waiting for available IP: %v", err)
+			return
+		}
+
+		log.Printf("Attempting to proxy request to IP: %s", ip)
+
+		// Create a URL from the IP
+		targetURL, err := url.Parse("http://" + ip + ":3001")
+		if err != nil {
+			lb.releaseIP(ctx, ip)
+			log.Printf("Error parsing URL for IP %s: %v", ip, err)
+			lastErr = err
+			continue // Try next IP
+		}
+
+		// Create a reverse proxy
+		proxy := httputil.NewSingleHostReverseProxy(targetURL)
+
+		// Set up a custom director to modify the request
+		originalDirector := proxy.Director
+		proxy.Director = func(req *http.Request) {
+			originalDirector(req)
+			req.Host = targetURL.Host
+
+			// Add debugging headers
+			req.Header.Set("X-Forwarded-For", req.RemoteAddr)
+			req.Header.Set("X-Forwarded-Host", req.Host)
+			req.Header.Set("X-Forwarded-Proto", "http")
+
+			// Log the outgoing request for debugging
+			log.Printf("Proxying request to %s: %s %s", targetURL.String(), req.Method, req.URL.Path)
+		}
+
+		// Create a channel to capture proxy errors
+		proxyErrChan := make(chan error, 1)
+
+		// Set up error handler
+		proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+			log.Printf("Proxy error handler triggered: %v", err)
+			proxyErrChan <- err
+		}
+
+		// Set up a custom response writer that will release the IP when done
+		responseWriter := &responseWriterWithCallback{
+			ResponseWriter: w,
+			callback: func() {
+				// Release the IP when the response is complete
+				if err := lb.releaseIP(ctx, ip); err != nil {
+					log.Printf("Error releasing IP %s: %v", ip, err)
+				}
+				log.Printf("Response completed and IP %s released", ip)
+			},
+		}
+
+		// Create a context with cancel for this specific proxy attempt
+		proxyCtx, cancelProxy := context.WithCancel(ctx)
+
+		// Create a channel to signal when the proxy is done
+		proxyDone := make(chan struct{})
+
+		// Forward the request to the target server in a goroutine
+		go func() {
+			// We need to clone the request to use the new context
+			proxyReq := r.Clone(proxyCtx)
+
+			// If this is a POST request with a body, we need to recreate the body
+			if proxyReq.Body != nil && proxyReq.Method == http.MethodPost {
+				// Read the body
+				bodyBytes, err := io.ReadAll(r.Body)
+				if err != nil {
+					proxyErrChan <- fmt.Errorf("error reading request body: %w", err)
+					close(proxyDone)
+					return
+				}
+
+				// Log the request body for debugging
+				log.Printf("Request body: %s", string(bodyBytes))
+
+				// Restore the original body for future attempts
+				r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+
+				// Set the body for this attempt
+				proxyReq.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+				proxyReq.ContentLength = int64(len(bodyBytes))
+			}
+
+			// Log that we're about to call ServeHTTP
+			log.Printf("Calling proxy.ServeHTTP for IP %s", ip)
+
+			// Serve the request
+			proxy.ServeHTTP(responseWriter, proxyReq)
+
+			// Log that ServeHTTP has completed
+			log.Printf("proxy.ServeHTTP completed for IP %s", ip)
+
+			// Make sure to finalize the response writer to release the IP
+			responseWriter.Finalize()
+
+			close(proxyDone)
+		}()
+
+		// Wait for either the proxy to complete or an error
+		select {
+		case <-proxyDone:
+			// Proxy completed successfully
+			log.Printf("Proxy completed successfully for IP %s", ip)
+			cancelProxy() // Clean up the context
+			return
+
+		case err := <-proxyErrChan:
+			log.Printf("Received error from proxy for IP %s: %v", ip, err)
+
+			// Check if it's a connection refused error
+			if isConnectionRefused(err) {
+				log.Printf("Connection refused for IP %s, trying next IP", ip)
+
+				// Send webhook notification about the connection refused
+				lb.sendWebhook(ip, err.Error())
+
+				lb.releaseIP(ctx, ip)
+				lastErr = err
+				cancelProxy() // Cancel the current proxy attempt
+
+				// Add a small delay before trying the next IP to avoid hammering servers
+				select {
+				case <-time.After(100 * time.Millisecond):
+					// Continue after delay
+				case <-ctx.Done():
+					// Client disconnected during delay
+					return
+				}
+
+				continue // Try next IP
+			}
+
+			// For other errors, fail immediately
+			lb.releaseIP(ctx, ip)
+			cancelProxy() // Clean up the context
+			http.Error(w, "Server error: "+err.Error(), http.StatusBadGateway)
+			log.Printf("Proxy error for IP %s: %v", ip, err)
+			return
+		}
+	}
+}
+
+// isConnectionRefused checks if an error is a connection refused error
+func isConnectionRefused(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	// Check for "connection refused" in the error message
+	if strings.Contains(err.Error(), "connection refused") {
+		return true
+	}
+
+	// Check for specific network errors
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		if netErr.Timeout() || netErr.Temporary() {
+			return true
 		}
 	}
 
-	// Call the original finalizer if it exists
-	if finalizer, ok := rc.ResponseWriter.(interface{ Finalize() }); ok {
-		finalizer.Finalize()
+	// Check for specific syscall errors
+	var syscallErr *os.SyscallError
+	if errors.As(err, &syscallErr) {
+		return true
 	}
+
+	return false
 }
 
 // responseWriterWithCallback wraps http.ResponseWriter to call a callback when the response is complete
@@ -296,18 +581,26 @@ type responseWriterWithCallback struct {
 	http.ResponseWriter
 	callback func()
 	once     sync.Once
+	written  bool
+	status   int
 }
 
 func (w *responseWriterWithCallback) Write(b []byte) (int, error) {
-	return w.ResponseWriter.Write(b)
+	w.written = true
+	n, err := w.ResponseWriter.Write(b)
+	log.Printf("responseWriterWithCallback.Write: wrote %d bytes, err: %v", n, err)
+	return n, err
 }
 
 func (w *responseWriterWithCallback) WriteHeader(statusCode int) {
+	w.status = statusCode
+	log.Printf("responseWriterWithCallback.WriteHeader: status %d", statusCode)
 	w.ResponseWriter.WriteHeader(statusCode)
 }
 
 func (w *responseWriterWithCallback) Flush() {
 	if flusher, ok := w.ResponseWriter.(http.Flusher); ok {
+		log.Printf("responseWriterWithCallback.Flush called")
 		flusher.Flush()
 	}
 }
@@ -320,6 +613,7 @@ func (w *responseWriterWithCallback) CloseNotify() <-chan bool {
 }
 
 func (w *responseWriterWithCallback) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	log.Printf("responseWriterWithCallback.Hijack called")
 	if hj, ok := w.ResponseWriter.(http.Hijacker); ok {
 		conn, buf, err := hj.Hijack()
 		if err == nil {
@@ -332,5 +626,121 @@ func (w *responseWriterWithCallback) Hijack() (net.Conn, *bufio.ReadWriter, erro
 
 // Finalize calls the callback
 func (w *responseWriterWithCallback) Finalize() {
+	log.Printf("responseWriterWithCallback.Finalize called, written: %v, status: %d", w.written, w.status)
 	w.once.Do(w.callback)
 }
+
+// Make sure responseWriterWithCallback implements all necessary interfaces
+var (
+	_ http.ResponseWriter = &responseWriterWithCallback{}
+	_ http.Flusher        = &responseWriterWithCallback{}
+	_ http.Hijacker       = &responseWriterWithCallback{}
+)
+
+// responseCapturer captures the response to cache it
+type responseCapturer struct {
+	http.ResponseWriter
+	cacheKey        string
+	pendingCacheKey string
+	lb              *LoadBalancer
+	ctx             context.Context
+	buffer          bytes.Buffer
+	status          int
+	headers         http.Header
+	written         bool
+	once            sync.Once
+}
+
+func (rc *responseCapturer) WriteHeader(statusCode int) {
+	rc.status = statusCode
+	rc.ResponseWriter.WriteHeader(statusCode)
+	log.Printf("responseCapturer.WriteHeader: status %d", statusCode)
+}
+
+func (rc *responseCapturer) Write(b []byte) (int, error) {
+	// Mark that we've written data
+	rc.written = true
+
+	// Only cache successful responses
+	if rc.status == 0 || rc.status == http.StatusOK {
+		rc.buffer.Write(b)
+	}
+
+	n, err := rc.ResponseWriter.Write(b)
+	log.Printf("responseCapturer.Write: wrote %d bytes, err: %v", n, err)
+
+	// Update cache as soon as we get data (don't wait for Finalize)
+	// This ensures the cache is updated even if the client disconnects
+	if rc.written && (rc.status == 0 || rc.status == http.StatusOK) {
+		rc.updateCache()
+	}
+
+	return n, err
+}
+
+func (rc *responseCapturer) updateCache() {
+	// Only update the cache once
+	rc.once.Do(func() {
+		if rc.buffer.Len() > 0 {
+			log.Printf("Updating cache for key: %s", rc.cacheKey)
+
+			// Use a pipeline to update both cache keys atomically
+			pipe := rc.lb.redisClient.Pipeline()
+
+			// Store the real response
+			pipe.Set(rc.ctx, rc.cacheKey, rc.buffer.Bytes(), rc.lb.cacheExpiration)
+
+			// Remove the pending marker
+			pipe.Del(rc.ctx, rc.pendingCacheKey)
+
+			// Execute the pipeline
+			if _, err := pipe.Exec(rc.ctx); err != nil {
+				log.Printf("Error updating cache: %v", err)
+			} else {
+				log.Printf("Successfully updated cache and removed pending key")
+			}
+		} else {
+			log.Printf("Not updating cache - buffer is empty")
+		}
+	})
+}
+
+func (rc *responseCapturer) Flush() {
+	if flusher, ok := rc.ResponseWriter.(http.Flusher); ok {
+		log.Printf("responseCapturer.Flush called")
+		flusher.Flush()
+	}
+}
+
+func (rc *responseCapturer) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	log.Printf("responseCapturer.Hijack called")
+	if hj, ok := rc.ResponseWriter.(http.Hijacker); ok {
+		conn, buf, err := hj.Hijack()
+		if err == nil {
+			// Update cache before hijacking
+			rc.updateCache()
+		}
+		return conn, buf, err
+	}
+	return nil, nil, errors.New("hijacking not supported")
+}
+
+// Finalize calls the callback
+func (rc *responseCapturer) Finalize() {
+	log.Printf("responseCapturer.Finalize called, written: %v, status: %d", rc.written, rc.status)
+
+	// Update cache one last time if needed
+	rc.updateCache()
+
+	// Call the original finalizer if it exists
+	if finalizer, ok := rc.ResponseWriter.(interface{ Finalize() }); ok {
+		finalizer.Finalize()
+	}
+}
+
+// Make sure responseCapturer implements all necessary interfaces
+var (
+	_ http.ResponseWriter = &responseCapturer{}
+	_ http.Flusher        = &responseCapturer{}
+	_ http.Hijacker       = &responseCapturer{}
+)
