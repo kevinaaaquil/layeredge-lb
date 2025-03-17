@@ -171,22 +171,42 @@ func (lb *LoadBalancer) releaseIP(ctx context.Context, ip string) error {
 	return err
 }
 
-// getCacheKey generates a cache key from request data
-func getCacheKeyFromData(data interface{}) (string, error) {
-	dataBytes, err := json.Marshal(data)
-	if err != nil {
-		return "", err
-	}
-	return cacheKeyPrefix + string(dataBytes), nil
+// CacheKeyData represents the data used to create a cache key
+type CacheKeyData struct {
+	Data      interface{} `json:"data,omitempty"`
+	Operation interface{} `json:"operation,omitempty"`
 }
 
-// getPendingCacheKey generates a pending cache key from request data
-func getPendingCacheKeyFromData(data interface{}) (string, error) {
-	dataBytes, err := json.Marshal(data)
-	if err != nil {
-		return "", err
+// getCacheKeyFromRequest generates a cache key from request data and operation
+func getCacheKeyFromRequest(requestData map[string]interface{}) (string, string, error) {
+	// Extract data and operation fields
+	data, hasData := requestData["data"]
+	operation, hasOperation := requestData["operation"]
+
+	if !hasData {
+		return "", "", errors.New("request has no data field")
 	}
-	return pendingCacheKeyPrefix + string(dataBytes), nil
+
+	// Create a combined key structure
+	keyData := CacheKeyData{
+		Data: data,
+	}
+
+	// Add operation if it exists
+	if hasOperation {
+		keyData.Operation = operation
+	}
+
+	// Marshal to JSON to create a consistent key
+	keyBytes, err := json.Marshal(keyData)
+	if err != nil {
+		return "", "", err
+	}
+
+	cacheKey := cacheKeyPrefix + string(keyBytes)
+	pendingCacheKey := pendingCacheKeyPrefix + string(keyBytes)
+
+	return cacheKey, pendingCacheKey, nil
 }
 
 // sendWebhook sends a notification to the webhook URL
@@ -195,7 +215,7 @@ func (lb *LoadBalancer) sendWebhook(ip string, errMsg string) {
 
 	// Create the payload
 	payload := WebhookPayload{
-		Text: fmt.Sprintf("Connection refused to IP %s", ip),
+		Text: fmt.Sprintf("Connection refused to IP %s <!channel>", ip),
 	}
 
 	// Convert payload to JSON
@@ -262,24 +282,25 @@ func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// Restore the body for later use
 		r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
 
-		// Try to extract the data field to use as cache key
+		// Try to extract the data and operation fields to use as cache key
 		var requestData map[string]interface{}
 		if err := json.Unmarshal(bodyBytes, &requestData); err == nil {
-			if data, ok := requestData["data"]; ok {
-				// Create cache keys
-				cacheKey, err := getCacheKeyFromData(data)
+			// Check if we have at least the data field
+			if _, hasData := requestData["data"]; hasData {
+				// Create cache keys using both data and operation fields
+				cacheKey, pendingCacheKey, err := getCacheKeyFromRequest(requestData)
 				if err != nil {
 					log.Printf("Error creating cache key: %v", err)
 					lb.handleProxy(w, r) // Fall back to normal proxy
 					return
 				}
 
-				pendingCacheKey, err := getPendingCacheKeyFromData(data)
-				if err != nil {
-					log.Printf("Error creating pending cache key: %v", err)
-					lb.handleProxy(w, r) // Fall back to normal proxy
-					return
+				// Log the cache key components for debugging
+				operation := "none"
+				if op, hasOp := requestData["operation"]; hasOp {
+					operation = fmt.Sprintf("%v", op)
 				}
+				log.Printf("Cache key created with operation: %s", operation)
 
 				// Check if we have a cached response
 				cachedResponse, err := lb.redisClient.Get(ctx, cacheKey).Bytes()
@@ -296,7 +317,7 @@ func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				pendingExists, err := lb.redisClient.Exists(ctx, pendingCacheKey).Result()
 				if err == nil && pendingExists > 0 {
 					// This request is already being processed
-					log.Printf("Request for data is pending, waiting for real response")
+					log.Printf("Request for data+operation is pending, waiting for real response")
 
 					// Set up a timeout context for the wait
 					waitCtx, cancel := context.WithTimeout(ctx, maxWaitTime)
