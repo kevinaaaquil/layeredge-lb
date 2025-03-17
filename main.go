@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -10,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/joho/godotenv"
+	_ "github.com/joho/godotenv/autoload"
 	"github.com/kevinaaaquil/layeredge-lb/loadbalancer"
 )
 
@@ -19,15 +20,16 @@ const (
 )
 
 func main() {
-	// load env from .env file
-	err := godotenv.Load()
-	if err != nil {
-		log.Fatal("Error loading .env file")
-	}
+	// // load env from .env file
+	// err := godotenv.Load()
+	// if err != nil {
+	// 	log.Fatal("Error loading .env file")
+	// }
 
 	// Read configuration from environment variables
 	redisAddr := os.Getenv("REDIS_ADDR")
 	if redisAddr == "" {
+		fmt.Println("REDIS_ADDR is not set")
 		redisAddr = "localhost:6379" // default value
 	}
 
@@ -52,22 +54,22 @@ func main() {
 		}
 	}
 
-	// Read IPs from file
-	ipsFilePath := os.Getenv("IPS_FILE")
-	if ipsFilePath == "" {
-		ipsFilePath = "ips.txt" // default value
-	}
+	// // Read IPs from file
+	// ipsFilePath := os.Getenv("IPS_FILE")
+	// if ipsFilePath == "" {
+	// 	ipsFilePath = "ips.txt" // default value
+	// }
 
-	ips, err := readIPsFromFile(ipsFilePath)
-	if err != nil {
-		log.Fatalf("Failed to read IPs from file: %v \n Error: %v", ipsFilePath, err)
-	}
+	// ips, err := readIPsFromFile(ipsFilePath)
+	// if err != nil {
+	// 	log.Fatalf("Failed to read IPs from file: %v \n Error: %v", ipsFilePath, err)
+	// }
 
-	if len(ips) == 0 {
-		log.Fatalf("No IPs provided in the file: %v", ipsFilePath)
-	}
+	// if len(ips) == 0 {
+	// 	log.Fatalf("No IPs provided in the file: %v", ipsFilePath)
+	// }
 
-	cacheEnabled := false
+	cacheEnabled := true
 	if cacheStr := os.Getenv("CACHE_ENABLED"); cacheStr == "true" || cacheStr == "1" {
 		cacheEnabled = true
 	}
@@ -77,6 +79,21 @@ func main() {
 		if expiration, err := strconv.Atoi(expirationStr); err == nil && expiration > 0 {
 			cacheExpiration = time.Duration(expiration) * time.Second
 		}
+	}
+
+	ipsEnv := os.Getenv("IPS")
+	var ips []string
+
+	if ipsEnv != "" {
+		// Split IPs by comma
+		ips = strings.Split(ipsEnv, ",")
+		// Trim whitespace from each IP
+		for i, ip := range ips {
+			ips[i] = strings.TrimSpace(ip)
+		}
+		log.Printf("Loaded %d IPs from environment", len(ips))
+	} else {
+		log.Println("No IPs specified in environment")
 	}
 
 	// Initialize load balancer with caching options
