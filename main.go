@@ -149,6 +149,13 @@ func getClientIP(r *http.Request) string {
 }
 
 func main() {
+
+	appEnv := os.Getenv("APP_ENV")
+	if appEnv == "" {
+		appEnv = "public"
+	}
+	log.Printf("APP_ENV: %s", appEnv)
+
 	// Read Redis URL from environment
 	redisURL := os.Getenv("REDIS_URL")
 	if redisURL == "" {
@@ -224,7 +231,6 @@ func main() {
 
 	// Check if we need to enable rate limiting
 	var handler http.Handler = lb
-	appEnv := os.Getenv("APP_ENV")
 
 	if appEnv == "public" {
 		// Read rate limit configuration - now in requests per minute
