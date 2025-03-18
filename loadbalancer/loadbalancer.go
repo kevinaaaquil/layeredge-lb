@@ -304,6 +304,38 @@ func (lb *LoadBalancer) sendWebhook(ip string, errMsg string) {
 func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
+	// Check if this is a POST request that might contain a ZKProverPayload
+	if r.Method == http.MethodPost {
+		// Read the request body
+		bodyBytes, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "Error reading request body", http.StatusBadRequest)
+			log.Printf("Error reading request body: %v", err)
+			return
+		}
+
+		// Restore the body for later use
+		r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+
+		// Try to parse as ZKProverPayload
+		var payload ZKProverPayload
+		if err := json.Unmarshal(bodyBytes, &payload); err == nil {
+			// If it looks like a ZKProverPayload (has operation field), validate it
+			if payload.Operation != "" {
+				if err := ValidateZKProverPayload(&payload); err != nil {
+					http.Error(w, fmt.Sprintf("Invalid payload: %v", err), http.StatusBadRequest)
+					log.Printf("Invalid ZKProverPayload: %v", err)
+					return
+				}
+
+				log.Printf("Valid ZKProverPayload received with operation: %s", payload.Operation)
+			}
+		}
+
+		// Restore the body again for processing
+		r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+	}
+
 	// Check if caching is enabled and this is a POST request
 	if lb.cacheEnabled && r.Method == http.MethodPost {
 		// Read the request body
@@ -427,10 +459,14 @@ func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		// Restore the body again if we couldn't use caching
 		r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+	} else {
+		// return error
+		http.Error(w, "Invalid request", http.StatusBadRequest)
+		return
 	}
 
 	// Normal proxy handling without caching
-	lb.handleProxy(w, r)
+	// lb.handleProxy(w, r)
 }
 
 func (lb *LoadBalancer) handleProxy(w http.ResponseWriter, r *http.Request) {
@@ -800,3 +836,46 @@ var (
 	_ http.Flusher        = &responseCapturer{}
 	_ http.Hijacker       = &responseCapturer{}
 )
+
+// ZKProverPayload represents the payload for ZK proving operations
+type ZKProverPayload struct {
+	Operation    string   `json:"operation"`
+	Data         []string `json:"data"`
+	ProofRequest *string  `json:"proof_request,omitempty"`
+	Proof        interface{} `json:"proof,omitempty"`
+}
+
+// ValidateZKProverPayload validates the ZKProverPayload struct
+// Returns an error if validation fails, nil otherwise
+func ValidateZKProverPayload(payload *ZKProverPayload) error {
+	// Validate operation type
+	if payload.Operation != "verify" && payload.Operation != "prove" {
+		return fmt.Errorf("invalid operation: %s. Must be 'verify' or 'prove'", payload.Operation)
+	}
+
+	// Validate required fields based on operation
+	if payload.Operation == "prove" {
+		// For "prove" operation, ProofRequest should be set and Proof should be nil
+		if payload.ProofRequest == nil {
+			return fmt.Errorf("prove operation requires proof_request field")
+		}
+		if payload.Proof != nil {
+			return fmt.Errorf("prove operation should not include proof field")
+		}
+	} else if payload.Operation == "verify" {
+		// For "verify" operation, Proof should be set and ProofRequest should be nil
+		if payload.Proof == nil {
+			return fmt.Errorf("verify operation requires proof field")
+		}
+		if payload.ProofRequest != nil {
+			return fmt.Errorf("verify operation should not include proof_request field")
+		}
+	}
+
+	// Validate data field
+	if len(payload.Data) == 0 {
+		return fmt.Errorf("data field is required and cannot be empty")
+	}
+
+	return nil
+}
