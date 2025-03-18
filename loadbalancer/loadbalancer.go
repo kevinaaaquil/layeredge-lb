@@ -85,6 +85,38 @@ func NewLoadBalancer(redisAddr, redisPassword string, redisDB int, timeout time.
 	}, nil
 }
 
+// NewLoadBalancerWithURL creates a new load balancer instance using a Redis URL
+func NewLoadBalancerWithURL(redisURL string, timeout time.Duration, cacheEnabled bool, cacheExpiration time.Duration) (*LoadBalancer, error) {
+	// Parse the Redis URL
+	opts, err := redis.ParseURL(redisURL)
+	if err != nil {
+		return nil, fmt.Errorf("invalid Redis URL: %w", err)
+	}
+
+	client := redis.NewClient(opts)
+
+	// Test connection
+	ctx := context.Background()
+	_, err = client.Ping(ctx).Result()
+	if err != nil {
+		return nil, err
+	}
+
+	// flush all keys
+	client.FlushAll(ctx).Result()
+
+	if cacheExpiration == 0 {
+		cacheExpiration = defaultCacheExpiration
+	}
+
+	return &LoadBalancer{
+		redisClient:     client,
+		timeout:         timeout,
+		cacheEnabled:    cacheEnabled,
+		cacheExpiration: cacheExpiration,
+	}, nil
+}
+
 // AddIP adds a new IP to the available pool
 func (lb *LoadBalancer) AddIP(ctx context.Context, ip string) error {
 	return lb.redisClient.SAdd(ctx, availableIPsKey, ip).Err()
