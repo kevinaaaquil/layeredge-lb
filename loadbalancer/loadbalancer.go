@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -38,6 +40,14 @@ const (
 	cacheCheckInterval = 100 * time.Millisecond
 	// Maximum time to wait for a real response
 	maxWaitTime = 30 * time.Minute
+	// Lock key for IP allocation
+	ipAllocationLockKey = "ip_allocation_lock"
+	// Lock expiration time to prevent deadlocks
+	lockExpiration = 5 * time.Second
+	// How long to wait between lock acquisition attempts
+	lockRetryDelay = 50 * time.Millisecond
+	// Maximum retries for lock acquisition
+	maxLockRetries = 10
 )
 
 // WebhookPayload represents the payload to send to the webhook
@@ -48,7 +58,6 @@ type WebhookPayload struct {
 // LoadBalancer represents a Redis-backed round-robin load balancer
 type LoadBalancer struct {
 	redisClient     *redis.Client
-	mutex           sync.Mutex
 	timeout         time.Duration
 	cacheEnabled    bool
 	cacheExpiration time.Duration
@@ -131,10 +140,78 @@ func (lb *LoadBalancer) RemoveIP(ctx context.Context, ip string) error {
 	return err
 }
 
+// generateLockValue creates a random value for the lock to ensure ownership
+func generateLockValue() string {
+	b := make([]byte, 16)
+	rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
+// acquireLock tries to acquire a Redis-based distributed lock
+func (lb *LoadBalancer) acquireLock(ctx context.Context, lockKey string, expiration time.Duration) (string, bool) {
+	// Generate a unique lock identifier
+	lockValue := generateLockValue()
+
+	// Try to set the key with NX option (only if it doesn't exist)
+	success, err := lb.redisClient.SetNX(ctx, lockKey, lockValue, expiration).Result()
+	if err != nil {
+		log.Printf("Error acquiring lock: %v", err)
+		return "", false
+	}
+
+	return lockValue, success
+}
+
+// releaseLock releases a previously acquired lock
+func (lb *LoadBalancer) releaseLock(ctx context.Context, lockKey, lockValue string) bool {
+	// Use a Lua script to ensure we only delete the lock if it's still ours
+	script := `
+		if redis.call("GET", KEYS[1]) == ARGV[1] then
+			return redis.call("DEL", KEYS[1])
+		else
+			return 0
+		end
+	`
+
+	result, err := lb.redisClient.Eval(ctx, script, []string{lockKey}, lockValue).Result()
+	if err != nil {
+		log.Printf("Error releasing lock: %v", err)
+		return false
+	}
+
+	// If result is 1, the lock was successfully deleted
+	return result.(int64) == 1
+}
+
 // getNextAvailableIP gets the next available IP using round-robin and marks it as in-use
 func (lb *LoadBalancer) getNextAvailableIP(ctx context.Context) (string, error) {
-	lb.mutex.Lock()
-	defer lb.mutex.Unlock()
+	// Try to acquire the distributed lock
+	var lockValue string
+	var lockAcquired bool
+
+	// Try multiple times to acquire the lock
+	for i := 0; i < maxLockRetries; i++ {
+		lockValue, lockAcquired = lb.acquireLock(ctx, ipAllocationLockKey, lockExpiration)
+		if lockAcquired {
+			break
+		}
+
+		// Wait a bit before retrying
+		select {
+		case <-time.After(lockRetryDelay):
+			// Continue to next attempt
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
+	}
+
+	// If we couldn't acquire the lock after multiple attempts, fail
+	if !lockAcquired {
+		return "", fmt.Errorf("could not acquire lock for IP allocation after %d attempts", maxLockRetries)
+	}
+
+	// Make sure to release the lock when we're done
+	defer lb.releaseLock(ctx, ipAllocationLockKey, lockValue)
 
 	// Get the next available IP
 	ip, err := lb.redisClient.SPop(ctx, availableIPsKey).Result()
@@ -199,6 +276,35 @@ func (lb *LoadBalancer) waitForAvailableIP(ctx context.Context) (string, error) 
 
 // releaseIP returns an IP to the available pool
 func (lb *LoadBalancer) releaseIP(ctx context.Context, ip string) error {
+	// Try to acquire the distributed lock
+	var lockValue string
+	var lockAcquired bool
+
+	// Try multiple times to acquire the lock
+	for i := 0; i < maxLockRetries; i++ {
+		lockValue, lockAcquired = lb.acquireLock(ctx, ipAllocationLockKey, lockExpiration)
+		if lockAcquired {
+			break
+		}
+
+		// Wait a bit before retrying
+		select {
+		case <-time.After(lockRetryDelay):
+			// Continue to next attempt
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+
+	// If we couldn't acquire the lock after multiple attempts, fail
+	if !lockAcquired {
+		return fmt.Errorf("could not acquire lock for IP release after %d attempts", maxLockRetries)
+	}
+
+	// Make sure to release the lock when we're done
+	defer lb.releaseLock(ctx, ipAllocationLockKey, lockValue)
+
+	// Use a pipeline to perform both operations atomically
 	pipe := lb.redisClient.Pipeline()
 	pipe.SRem(ctx, inUseIPsKey, ip)
 	pipe.SAdd(ctx, availableIPsKey, ip)
