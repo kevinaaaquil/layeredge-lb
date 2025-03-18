@@ -62,6 +62,7 @@ func main() {
 		// Trim whitespace from each IP
 		for i, ip := range ips {
 			ips[i] = strings.TrimSpace(ip)
+			log.Printf("Loaded IP %s from environment", ips[i])
 		}
 		log.Printf("Loaded %d IPs from environment", len(ips))
 	} else {
