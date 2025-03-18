@@ -303,10 +303,20 @@ func (lb *LoadBalancer) sendWebhook(ip string, errMsg string) {
 // ServeHTTP implements the http.Handler interface to handle load balancing
 func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+	log.Printf("LoadBalancer.ServeHTTP called for %s %s", r.Method, r.URL.Path)
+
+	// Add a diagnostic endpoint
+	if r.URL.Path == "/ping" {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"status":"ok","message":"loadbalancer is running"}`))
+		log.Printf("Responded to ping request")
+		return
+	}
 
 	// Check if this is a POST request that might contain a ZKProverPayload
 	if r.Method == http.MethodPost {
 		// Read the request body
+		log.Printf("Reading request body")
 		bodyBytes, err := io.ReadAll(r.Body)
 		if err != nil {
 			http.Error(w, "Error reading request body", http.StatusBadRequest)
@@ -321,6 +331,12 @@ func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		var payload ZKProverPayload
 		if err := json.Unmarshal(bodyBytes, &payload); err == nil {
 			// If it looks like a ZKProverPayload (has operation field), validate it
+			if payload.Operation == "" {
+				log.Printf("No operation field found in ZKProverPayload")
+				http.Error(w, "Invalid payload: no operation field", http.StatusBadRequest)
+				return
+			}
+
 			if payload.Operation != "" {
 				if err := ValidateZKProverPayload(&payload); err != nil {
 					http.Error(w, fmt.Sprintf("Invalid payload: %v", err), http.StatusBadRequest)
@@ -503,6 +519,7 @@ func (lb *LoadBalancer) handleProxy(w http.ResponseWriter, r *http.Request) {
 
 		// Create a URL from the IP
 		targetURL, err := url.Parse("http://" + ip + ":3001")
+		log.Printf("targetURL: %s", targetURL)
 		if err != nil {
 			lb.releaseIP(ctx, ip)
 			log.Printf("Error parsing URL for IP %s: %v", ip, err)
@@ -839,9 +856,9 @@ var (
 
 // ZKProverPayload represents the payload for ZK proving operations
 type ZKProverPayload struct {
-	Operation    string   `json:"operation"`
-	Data         []string `json:"data"`
-	ProofRequest *string  `json:"proof_request,omitempty"`
+	Operation    string      `json:"operation"`
+	Data         []string    `json:"data"`
+	ProofRequest *string     `json:"proof_request,omitempty"`
 	Proof        interface{} `json:"proof,omitempty"`
 }
 
@@ -849,10 +866,12 @@ type ZKProverPayload struct {
 // Returns an error if validation fails, nil otherwise
 func ValidateZKProverPayload(payload *ZKProverPayload) error {
 	// Validate operation type
+	log.Printf("Validating operation: %s", payload.Operation)
 	if payload.Operation != "verify" && payload.Operation != "prove" {
+		log.Printf("Invalid operation: %s. Must be 'verify' or 'prove'", payload.Operation)
 		return fmt.Errorf("invalid operation: %s. Must be 'verify' or 'prove'", payload.Operation)
 	}
-
+	log.Printf("Validated operation: %s", payload.Operation)
 	// Validate required fields based on operation
 	if payload.Operation == "prove" {
 		// For "prove" operation, ProofRequest should be set and Proof should be nil
