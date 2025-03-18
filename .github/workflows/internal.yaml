@@ -1,0 +1,28 @@
+name: Internal Deployment
+
+on:
+  push:
+    branches:
+      - internal
+
+jobs:
+  push:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - id: deploy
+        name: Deploy to dokku
+        uses: idoberko2/dokku-deploy-github-action@v1.0.1
+        with:
+          ssh-private-key: ${{ secrets.PROD_2_SECRET_MUMBAI }}
+          dokku-host: '3.109.50.112'
+          ssh-port: '22'
+          app-name: 'layeredge-lb-internal'
+          git-push-flags: '--force'

@@ -21,6 +21,6 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -a -installsuffix cgo -o app 
 
 
 # Exposes port 8080 because our program listens on that port
-EXPOSE 8080
+EXPOSE 6969
 
 CMD ["./app"]
