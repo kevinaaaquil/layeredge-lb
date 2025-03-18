@@ -1,9 +1,7 @@
 package main
 
 import (
-	"bufio"
 	"context"
-	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -20,34 +18,20 @@ const (
 )
 
 func main() {
-	// // load env from .env file
-	// err := godotenv.Load()
-	// if err != nil {
-	// 	log.Fatal("Error loading .env file")
-	// }
-
-	// Read configuration from environment variables
-	redisAddr := os.Getenv("REDIS_URL")
-	if redisAddr == "" {
-		fmt.Println("REDIS_URL is not set")
-		redisAddr = "localhost:6379" // default value
+	// Read Redis URL from environment
+	redisURL := os.Getenv("REDIS_URL")
+	if redisURL == "" {
+		redisURL = "redis://localhost:6379/0" // default value
 	}
-	log.Printf("REDIS_URL: %s", redisAddr)
+	log.Printf("REDIS_URL: %s", redisURL)
 
-	redisPassword := os.Getenv("REDIS_PASSWORD")
-	log.Printf("REDIS_PASSWORD: %s", redisPassword)
-	redisDB := 0
-	if dbStr := os.Getenv("REDIS_DB"); dbStr != "" {
-		if db, err := strconv.Atoi(dbStr); err == nil {
-			redisDB = db
-		}
-	}
-	log.Printf("REDIS_DB: %d", redisDB)
+	// Read other configuration from environment variables
 	listenAddr := os.Getenv("LISTEN_ADDR")
 	if listenAddr == "" {
 		listenAddr = ":8080" // default value
 	}
 	log.Printf("LISTEN_ADDR: %s", listenAddr)
+
 	timeoutSec := 60 * 10 // 10 minutes
 	if timeoutStr := os.Getenv("TIMEOUT_SEC"); timeoutStr != "" {
 		if timeout, err := strconv.Atoi(timeoutStr); err == nil {
@@ -55,24 +39,10 @@ func main() {
 		}
 	}
 	log.Printf("TIMEOUT_SEC: %d", timeoutSec)
-	// // Read IPs from file
-	// ipsFilePath := os.Getenv("IPS_FILE")
-	// if ipsFilePath == "" {
-	// 	ipsFilePath = "ips.txt" // default value
-	// }
-
-	// ips, err := readIPsFromFile(ipsFilePath)
-	// if err != nil {
-	// 	log.Fatalf("Failed to read IPs from file: %v \n Error: %v", ipsFilePath, err)
-	// }
-
-	// if len(ips) == 0 {
-	// 	log.Fatalf("No IPs provided in the file: %v", ipsFilePath)
-	// }
 
 	cacheEnabled := true
-	if cacheStr := os.Getenv("CACHE_ENABLED"); cacheStr == "true" || cacheStr == "1" {
-		cacheEnabled = true
+	if cacheStr := os.Getenv("CACHE_ENABLED"); cacheStr == "false" || cacheStr == "0" {
+		cacheEnabled = false
 	}
 
 	cacheExpiration := defaultCacheExpiration
@@ -82,6 +52,7 @@ func main() {
 		}
 	}
 
+	// Read IPs from environment
 	ipsEnv := os.Getenv("IPS")
 	var ips []string
 
@@ -97,11 +68,9 @@ func main() {
 		log.Println("No IPs specified in environment")
 	}
 
-	// Initialize load balancer with caching options
-	lb, err := loadbalancer.NewLoadBalancer(
-		redisAddr,
-		redisPassword,
-		redisDB,
+	// Initialize load balancer with Redis URL
+	lb, err := loadbalancer.NewLoadBalancerWithURL(
+		redisURL,
 		time.Duration(timeoutSec)*time.Second,
 		cacheEnabled,
 		cacheExpiration,
@@ -125,28 +94,4 @@ func main() {
 		Handler: lb,
 	}
 	log.Fatal(server.ListenAndServe())
-}
-
-// readIPsFromFile reads IPs from a text file, one IP per line
-func readIPsFromFile(filepath string) ([]string, error) {
-	file, err := os.Open(filepath)
-	if err != nil {
-		return nil, err
-	}
-	defer file.Close()
-
-	var ips []string
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		ip := strings.TrimSpace(scanner.Text())
-		if ip != "" && !strings.HasPrefix(ip, "#") { // Skip empty lines and comments
-			ips = append(ips, ip)
-		}
-	}
-
-	if err := scanner.Err(); err != nil {
-		return nil, err
-	}
-
-	return ips, nil
 }
