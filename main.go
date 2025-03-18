@@ -27,33 +27,34 @@ func main() {
 	// }
 
 	// Read configuration from environment variables
-	redisAddr := os.Getenv("REDIS_ADDR")
+	redisAddr := os.Getenv("REDIS_URL")
 	if redisAddr == "" {
-		fmt.Println("REDIS_ADDR is not set")
+		fmt.Println("REDIS_URL is not set")
 		redisAddr = "localhost:6379" // default value
 	}
+	log.Printf("REDIS_URL: %s", redisAddr)
 
 	redisPassword := os.Getenv("REDIS_PASSWORD")
-
+	log.Printf("REDIS_PASSWORD: %s", redisPassword)
 	redisDB := 0
 	if dbStr := os.Getenv("REDIS_DB"); dbStr != "" {
 		if db, err := strconv.Atoi(dbStr); err == nil {
 			redisDB = db
 		}
 	}
-
+	log.Printf("REDIS_DB: %d", redisDB)
 	listenAddr := os.Getenv("LISTEN_ADDR")
 	if listenAddr == "" {
 		listenAddr = ":8080" // default value
 	}
-
+	log.Printf("LISTEN_ADDR: %s", listenAddr)
 	timeoutSec := 60 * 10 // 10 minutes
 	if timeoutStr := os.Getenv("TIMEOUT_SEC"); timeoutStr != "" {
 		if timeout, err := strconv.Atoi(timeoutStr); err == nil {
 			timeoutSec = timeout
 		}
 	}
-
+	log.Printf("TIMEOUT_SEC: %d", timeoutSec)
 	// // Read IPs from file
 	// ipsFilePath := os.Getenv("IPS_FILE")
 	// if ipsFilePath == "" {
