@@ -596,6 +596,17 @@ func (lb *LoadBalancer) handleProxy(w http.ResponseWriter, r *http.Request) {
 
 	// Keep track of the last error
 	var lastErr error
+	var currentIP string
+
+	// Make sure we always release any IP we've acquired
+	defer func() {
+		if currentIP != "" {
+			log.Printf("Request context done, releasing IP %s", currentIP)
+			if err := lb.releaseIP(context.Background(), currentIP); err != nil {
+				log.Printf("Error releasing IP %s during cleanup: %v", currentIP, err)
+			}
+		}
+	}()
 
 	// Try to find a working IP - infinite loop until success or context cancellation
 	for {
@@ -621,6 +632,8 @@ func (lb *LoadBalancer) handleProxy(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		// Track the current IP so we can release it in the defer function if needed
+		currentIP = ip
 		log.Printf("Attempting to proxy request to IP: %s", ip)
 
 		// Create a URL from the IP
