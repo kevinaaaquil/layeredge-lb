@@ -56,6 +56,7 @@ type WebhookPayload struct {
 }
 
 // LoadBalancer represents a Redis-backed round-robin load balancer
+
 type LoadBalancer struct {
 	redisClient     *redis.Client
 	timeout         time.Duration
@@ -85,6 +86,11 @@ func NewLoadBalancer(redisAddr, redisPassword string, redisDB int, timeout time.
 	if cacheExpiration == 0 {
 		cacheExpiration = defaultCacheExpiration
 	}
+
+	log.Printf("Redis client created: %v", client)
+	log.Printf("Timeout: %v", timeout)
+	log.Printf("Cache enabled: %v", cacheEnabled)
+	log.Printf("Cache expiration: %v", cacheExpiration)
 
 	return &LoadBalancer{
 		redisClient:     client,
@@ -117,6 +123,11 @@ func NewLoadBalancerWithURL(redisURL string, timeout time.Duration, cacheEnabled
 	if cacheExpiration == 0 {
 		cacheExpiration = defaultCacheExpiration
 	}
+
+	log.Printf("Redis client created: %v", client)
+	log.Printf("Timeout: %v", timeout)
+	log.Printf("Cache enabled: %v", cacheEnabled)
+	log.Printf("Cache expiration: %v", cacheExpiration)
 
 	return &LoadBalancer{
 		redisClient:     client,
