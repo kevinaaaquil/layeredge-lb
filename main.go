@@ -82,9 +82,9 @@ func main() {
 
 	// Add IPs to the load balancer
 	ctx := context.Background()
-	for _, ip := range ips {
+	for i, ip := range ips {
 		if ip != "" {
-			if err := lb.AddIP(ctx, ip); err != nil {
+			if err := lb.AddIP(ctx, ip, i%2 == 0); err != nil {
 				log.Printf("Failed to add IP %s: %v", ip, err)
 			}
 		}

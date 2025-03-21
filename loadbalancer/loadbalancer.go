@@ -33,7 +33,7 @@ const (
 	// Redis key prefix for pending responses
 	pendingCacheKeyPrefix = "pending_response:"
 	// Default cache expiration time
-	defaultCacheExpiration = 30 * time.Minute
+	defaultCacheExpiration = 60 * time.Minute
 	// Placeholder response message
 	placeholderResponse = `{"status":"pending","message":"Your request is being processed"}`
 	// How often to check for a real response when waiting
@@ -47,7 +47,7 @@ const (
 	// How long to wait between lock acquisition attempts
 	lockRetryDelay = 50 * time.Millisecond
 	// Maximum retries for lock acquisition
-	maxLockRetries = 10
+	maxLockRetries = 40
 )
 
 // WebhookPayload represents the payload to send to the webhook
@@ -138,8 +138,16 @@ func NewLoadBalancerWithURL(redisURL string, timeout time.Duration, cacheEnabled
 }
 
 // AddIP adds a new IP to the available pool
-func (lb *LoadBalancer) AddIP(ctx context.Context, ip string) error {
-	return lb.redisClient.SAdd(ctx, availableIPsKey, ip).Err()
+func (lb *LoadBalancer) AddIP(ctx context.Context, ip string, isProve bool) error {
+	var ipStr string
+
+	if isProve {
+		ipStr = fmt.Sprintf("%s:%s", ip, "prove")
+	} else {
+		ipStr = fmt.Sprintf("%s:%s", ip, "verify")
+	}
+
+	return lb.redisClient.SAdd(ctx, availableIPsKey, ipStr).Err()
 }
 
 // RemoveIP removes an IP from both available and in-use pools
@@ -195,7 +203,7 @@ func (lb *LoadBalancer) releaseLock(ctx context.Context, lockKey, lockValue stri
 }
 
 // getNextAvailableIP gets the next available IP using round-robin and marks it as in-use
-func (lb *LoadBalancer) getNextAvailableIP(ctx context.Context) (string, error) {
+func (lb *LoadBalancer) getNextAvailableIP(ctx context.Context, isProve bool) (string, error) {
 	// Try to acquire the distributed lock
 	var lockValue string
 	var lockAcquired bool
@@ -224,28 +232,50 @@ func (lb *LoadBalancer) getNextAvailableIP(ctx context.Context) (string, error) 
 	// Make sure to release the lock when we're done
 	defer lb.releaseLock(ctx, ipAllocationLockKey, lockValue)
 
-	// Get the next available IP
-	ip, err := lb.redisClient.SPop(ctx, availableIPsKey).Result()
+	// Get all available IPs
+	ips, err := lb.redisClient.SMembers(ctx, availableIPsKey).Result()
 	if err != nil {
-		if err == redis.Nil {
-			return "", errors.New("no available IPs")
+		return "", err
+	}
+
+	// Filter IPs based on the pattern
+	pattern := ":verify"
+	if isProve {
+		pattern = ":prove"
+	}
+
+	// Find an IP with the matching pattern
+	var selectedIP string
+	for _, ip := range ips {
+		if strings.HasSuffix(ip, pattern) {
+			selectedIP = ip
+			break
 		}
+	}
+
+	if selectedIP == "" {
+		return "", errors.New("no available IPs matching required type")
+	}
+
+	// Remove the selected IP from available pool
+	err = lb.redisClient.SRem(ctx, availableIPsKey, selectedIP).Err()
+	if err != nil {
 		return "", err
 	}
 
 	// Mark the IP as in-use
-	err = lb.redisClient.SAdd(ctx, inUseIPsKey, ip).Err()
+	err = lb.redisClient.SAdd(ctx, inUseIPsKey, selectedIP).Err()
 	if err != nil {
 		// Try to put the IP back in the available pool
-		lb.redisClient.SAdd(ctx, availableIPsKey, ip)
+		lb.redisClient.SAdd(ctx, availableIPsKey, selectedIP)
 		return "", err
 	}
 
-	return ip, nil
+	return selectedIP, nil
 }
 
 // waitForAvailableIP waits for an available IP with a backoff strategy
-func (lb *LoadBalancer) waitForAvailableIP(ctx context.Context) (string, error) {
+func (lb *LoadBalancer) waitForAvailableIP(ctx context.Context, isProve bool) (string, error) {
 	// Initial wait time
 	waitTime := 100 * time.Millisecond
 	maxWaitTime := 5 * time.Second
@@ -257,7 +287,7 @@ func (lb *LoadBalancer) waitForAvailableIP(ctx context.Context) (string, error) 
 			return "", ctx.Err()
 		default:
 			// Try to get an IP
-			ip, err := lb.getNextAvailableIP(ctx)
+			ip, err := lb.getNextAvailableIP(ctx, isProve)
 			if err == nil {
 				return ip, nil
 			}
@@ -605,8 +635,27 @@ func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (lb *LoadBalancer) handleProxy(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "Error reading request body", http.StatusBadRequest)
+		log.Printf("Error reading request body: %v", err)
+		return
+	}
+
+	// Restore the body for later use
+	r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+
+	// Try to parse as ZKProverPayload
+	var payload ZKProverPayload
+	var isProve bool
+
+	if err := json.Unmarshal(bodyBytes, &payload); err == nil {
+		isProve = payload.Operation == "prove"
+	}
+
 	// Keep track of the last error
 	var lastErr error
+
 	var currentIP string
 
 	// Make sure we always release any IP we've acquired
@@ -636,7 +685,7 @@ func (lb *LoadBalancer) handleProxy(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// Get the next available IP, waiting if necessary
-		ip, err := lb.waitForAvailableIP(ctx)
+		ip, err := lb.waitForAvailableIP(ctx, isProve)
 		if err != nil {
 			http.Error(w, "Failed to get available server: "+err.Error(), http.StatusServiceUnavailable)
 			log.Printf("Error waiting for available IP: %v", err)
@@ -648,7 +697,10 @@ func (lb *LoadBalancer) handleProxy(w http.ResponseWriter, r *http.Request) {
 		log.Printf("Attempting to proxy request to IP: %s", ip)
 
 		// Create a URL from the IP
-		targetURL, err := url.Parse("http://" + ip + ":3001")
+		// Split IP into base IP and type (prove/verify)
+		parts := strings.Split(ip, ":")
+		baseIP := parts[0]
+		targetURL, err := url.Parse("http://" + baseIP + ":3001")
 		log.Printf("targetURL: %s", targetURL)
 		if err != nil {
 			lb.releaseIP(ctx, ip)
