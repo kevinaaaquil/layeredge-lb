@@ -45,9 +45,9 @@ const (
 	// Lock expiration time to prevent deadlocks
 	lockExpiration = 5 * time.Second
 	// How long to wait between lock acquisition attempts
-	lockRetryDelay = 50 * time.Millisecond
+	lockRetryDelay = 1 * time.Second
 	// Maximum retries for lock acquisition
-	maxLockRetries = 40
+	maxLockRetries = 120
 )
 
 // WebhookPayload represents the payload to send to the webhook
