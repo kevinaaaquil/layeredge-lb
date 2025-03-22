@@ -33,7 +33,7 @@ const (
 	// Redis key prefix for pending responses
 	pendingCacheKeyPrefix = "pending_response:"
 	// Default cache expiration time
-	defaultCacheExpiration = 30 * time.Minute
+	defaultCacheExpiration = 60 * time.Minute
 	// Placeholder response message
 	placeholderResponse = `{"status":"pending","message":"Your request is being processed"}`
 	// How often to check for a real response when waiting
@@ -45,9 +45,9 @@ const (
 	// Lock expiration time to prevent deadlocks
 	lockExpiration = 5 * time.Second
 	// How long to wait between lock acquisition attempts
-	lockRetryDelay = 50 * time.Millisecond
+	lockRetryDelay = 1 * time.Second
 	// Maximum retries for lock acquisition
-	maxLockRetries = 10
+	maxLockRetries = 120
 )
 
 // WebhookPayload represents the payload to send to the webhook
@@ -138,8 +138,16 @@ func NewLoadBalancerWithURL(redisURL string, timeout time.Duration, cacheEnabled
 }
 
 // AddIP adds a new IP to the available pool
-func (lb *LoadBalancer) AddIP(ctx context.Context, ip string) error {
-	return lb.redisClient.SAdd(ctx, availableIPsKey, ip).Err()
+func (lb *LoadBalancer) AddIP(ctx context.Context, ip string, isProve bool) error {
+	var ipStr string
+
+	if isProve {
+		ipStr = fmt.Sprintf("%s:%s", ip, "prove")
+	} else {
+		ipStr = fmt.Sprintf("%s:%s", ip, "verify")
+	}
+
+	return lb.redisClient.SAdd(ctx, availableIPsKey, ipStr).Err()
 }
 
 // RemoveIP removes an IP from both available and in-use pools
@@ -195,7 +203,7 @@ func (lb *LoadBalancer) releaseLock(ctx context.Context, lockKey, lockValue stri
 }
 
 // getNextAvailableIP gets the next available IP using round-robin and marks it as in-use
-func (lb *LoadBalancer) getNextAvailableIP(ctx context.Context) (string, error) {
+func (lb *LoadBalancer) getNextAvailableIP(ctx context.Context, isProve bool) (string, error) {
 	// Try to acquire the distributed lock
 	var lockValue string
 	var lockAcquired bool
@@ -224,28 +232,50 @@ func (lb *LoadBalancer) getNextAvailableIP(ctx context.Context) (string, error) 
 	// Make sure to release the lock when we're done
 	defer lb.releaseLock(ctx, ipAllocationLockKey, lockValue)
 
-	// Get the next available IP
-	ip, err := lb.redisClient.SPop(ctx, availableIPsKey).Result()
+	// Get all available IPs
+	ips, err := lb.redisClient.SMembers(ctx, availableIPsKey).Result()
 	if err != nil {
-		if err == redis.Nil {
-			return "", errors.New("no available IPs")
+		return "", err
+	}
+
+	// Filter IPs based on the pattern
+	pattern := ":verify"
+	if isProve {
+		pattern = ":prove"
+	}
+
+	// Find an IP with the matching pattern
+	var selectedIP string
+	for _, ip := range ips {
+		if strings.HasSuffix(ip, pattern) {
+			selectedIP = ip
+			break
 		}
+	}
+
+	if selectedIP == "" {
+		return "", errors.New("no available IPs matching required type")
+	}
+
+	// Remove the selected IP from available pool
+	err = lb.redisClient.SRem(ctx, availableIPsKey, selectedIP).Err()
+	if err != nil {
 		return "", err
 	}
 
 	// Mark the IP as in-use
-	err = lb.redisClient.SAdd(ctx, inUseIPsKey, ip).Err()
+	err = lb.redisClient.SAdd(ctx, inUseIPsKey, selectedIP).Err()
 	if err != nil {
 		// Try to put the IP back in the available pool
-		lb.redisClient.SAdd(ctx, availableIPsKey, ip)
+		lb.redisClient.SAdd(ctx, availableIPsKey, selectedIP)
 		return "", err
 	}
 
-	return ip, nil
+	return selectedIP, nil
 }
 
 // waitForAvailableIP waits for an available IP with a backoff strategy
-func (lb *LoadBalancer) waitForAvailableIP(ctx context.Context) (string, error) {
+func (lb *LoadBalancer) waitForAvailableIP(ctx context.Context, isProve bool) (string, error) {
 	// Initial wait time
 	waitTime := 100 * time.Millisecond
 	maxWaitTime := 5 * time.Second
@@ -257,7 +287,7 @@ func (lb *LoadBalancer) waitForAvailableIP(ctx context.Context) (string, error) 
 			return "", ctx.Err()
 		default:
 			// Try to get an IP
-			ip, err := lb.getNextAvailableIP(ctx)
+			ip, err := lb.getNextAvailableIP(ctx, isProve)
 			if err == nil {
 				return ip, nil
 			}
@@ -430,183 +460,216 @@ func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Check if this is a POST request that might contain a ZKProverPayload
-	if r.Method == http.MethodPost {
-		// Read the request body
-		log.Printf("Reading request body")
-		bodyBytes, err := io.ReadAll(r.Body)
-		if err != nil {
-			http.Error(w, "Error reading request body", http.StatusBadRequest)
-			log.Printf("Error reading request body: %v", err)
-			return
-		}
-
-		// Restore the body for later use
-		r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
-
-		// Try to parse as ZKProverPayload
-		var payload ZKProverPayload
-		if err := json.Unmarshal(bodyBytes, &payload); err == nil {
-			// If it looks like a ZKProverPayload (has operation field), validate it
-			if payload.Operation == "" {
-				log.Printf("No operation field found in ZKProverPayload")
-				http.Error(w, "Invalid payload: no operation field", http.StatusBadRequest)
-				return
-			}
-
-			if payload.Operation != "" {
-				if err := ValidateZKProverPayload(&payload); err != nil {
-					http.Error(w, fmt.Sprintf("Invalid payload: %v", err), http.StatusBadRequest)
-					log.Printf("Invalid ZKProverPayload: %v", err)
-					return
-				}
-
-				log.Printf("Valid ZKProverPayload received with operation: %s", payload.Operation)
-			}
-		}
-
-		// Restore the body again for processing
-		r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
-	}
-
-	// Check if caching is enabled and this is a POST request
-	if lb.cacheEnabled && r.Method == http.MethodPost {
-		// Read the request body
-		bodyBytes, err := io.ReadAll(r.Body)
-		if err != nil {
-			http.Error(w, "Error reading request body", http.StatusBadRequest)
-			log.Printf("Error reading request body: %v", err)
-			return
-		}
-
-		// Restore the body for later use
-		r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
-
-		// Try to extract the data and operation fields to use as cache key
-		var requestData map[string]interface{}
-		if err := json.Unmarshal(bodyBytes, &requestData); err == nil {
-			// Check if we have at least the data field
-			if _, hasData := requestData["data"]; hasData {
-				// Create cache keys using both data and operation fields
-				cacheKey, pendingCacheKey, err := getCacheKeyFromRequest(requestData)
-				if err != nil {
-					log.Printf("Error creating cache key: %v", err)
-					lb.handleProxy(w, r) // Fall back to normal proxy
-					return
-				}
-
-				// Log the cache key components for debugging
-				operation := "none"
-				if op, hasOp := requestData["operation"]; hasOp {
-					operation = fmt.Sprintf("%v", op)
-				}
-				log.Printf("Cache key created with operation: %s", operation)
-
-				// Check if we have a cached response
-				cachedResponse, err := lb.redisClient.Get(ctx, cacheKey).Bytes()
-				if err == nil && len(cachedResponse) > 0 {
-					// We have a cached response, return it
-					log.Printf("Cache hit for key: %s", cacheKey)
-					w.Header().Set("Content-Type", "application/json")
-					w.Header().Set("X-Cache", "HIT")
-					w.Write(cachedResponse)
-					return
-				}
-
-				// Check if this request is already being processed
-				pendingExists, err := lb.redisClient.Exists(ctx, pendingCacheKey).Result()
-				if err == nil && pendingExists > 0 {
-					// This request is already being processed
-					log.Printf("Request for data+operation is pending, waiting for real response")
-
-					// Set up a timeout context for the wait
-					waitCtx, cancel := context.WithTimeout(ctx, maxWaitTime)
-					defer cancel()
-
-					// Set up a ticker to periodically check for the real response
-					ticker := time.NewTicker(cacheCheckInterval)
-					defer ticker.Stop()
-
-					// Wait for either the real response or timeout
-					for {
-						select {
-						case <-ticker.C:
-							// Check if the real response is now available
-							cachedResponse, err := lb.redisClient.Get(waitCtx, cacheKey).Bytes()
-							if err == nil && len(cachedResponse) > 0 {
-								// We have a real response now, return it
-								log.Printf("Found cached response while waiting")
-								w.Header().Set("Content-Type", "application/json")
-								w.Header().Set("X-Cache", "WAIT-HIT")
-								w.Write(cachedResponse)
-								return
-							}
-
-							// Check if the pending key still exists
-							pendingExists, err := lb.redisClient.Exists(waitCtx, pendingCacheKey).Result()
-							if err != nil || pendingExists == 0 {
-								// The pending key is gone but no real response is available
-								// This is an error condition - the original request failed
-								log.Printf("Pending key disappeared without a real response")
-								http.Error(w, "Request processing failed", http.StatusInternalServerError)
-								return
-							}
-
-						case <-waitCtx.Done():
-							// We've waited too long, give up
-							log.Printf("Timeout waiting for real response after %v", maxWaitTime)
-							http.Error(w, "Timeout waiting for response", http.StatusGatewayTimeout)
-							return
-
-						case <-r.Context().Done():
-							// The client disconnected
-							log.Printf("Client disconnected while waiting for response")
-							return
-						}
-					}
-				}
-
-				// This is a new request, store a placeholder in Redis
-				log.Printf("Setting pending cache key: %s", pendingCacheKey)
-				err = lb.redisClient.Set(ctx, pendingCacheKey, []byte(placeholderResponse), lb.cacheExpiration).Err()
-				if err != nil {
-					log.Printf("Error setting pending cache: %v", err)
-					// Continue with proxy even if caching fails
-				}
-
-				// Create a response capturer to update the cache with the real response
-				responseCapture := &responseCapturer{
-					ResponseWriter:  w,
-					cacheKey:        cacheKey,
-					pendingCacheKey: pendingCacheKey,
-					lb:              lb,
-					ctx:             ctx,
-				}
-
-				// Continue with normal proxy handling but use our capturing writer
-				log.Printf("Proceeding with proxy using response capturer")
-				lb.handleProxy(responseCapture, r)
-				return
-			}
-		}
-
-		// Restore the body again if we couldn't use caching
-		r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
-	} else {
-		// return error
-		http.Error(w, "Invalid request", http.StatusBadRequest)
+	// Only accept POST requests
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed. Only POST requests are supported.", http.StatusMethodNotAllowed)
+		log.Printf("Rejected %s request to %s", r.Method, r.URL.Path)
 		return
 	}
 
-	// Normal proxy handling without caching
-	// lb.handleProxy(w, r)
+	// Read the request body
+	log.Printf("Reading request body")
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "Error reading request body", http.StatusBadRequest)
+		log.Printf("Error reading request body: %v", err)
+		return
+	}
+
+	// Restore the body for later use
+	r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+
+	// Try to parse as ZKProverPayload
+	var payload ZKProverPayload
+	if err := json.Unmarshal(bodyBytes, &payload); err != nil {
+		http.Error(w, "Invalid payload: could not parse JSON", http.StatusBadRequest)
+		log.Printf("Error parsing JSON payload: %v", err)
+		return
+	}
+
+	// Validate it's a proper ZKProverPayload
+	if payload.Operation == "" {
+		log.Printf("No operation field found in ZKProverPayload")
+		http.Error(w, "Invalid payload: no operation field", http.StatusBadRequest)
+		return
+	}
+
+	// Validate the payload
+	if err := ValidateZKProverPayload(&payload); err != nil {
+		http.Error(w, fmt.Sprintf("Invalid payload: %v", err), http.StatusBadRequest)
+		log.Printf("Invalid ZKProverPayload: %v", err)
+		return
+	}
+
+	log.Printf("Valid ZKProverPayload received with operation: %s", payload.Operation)
+
+	// Restore the body again for processing
+	r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+
+	// Continue with caching and proxying logic
+	if lb.cacheEnabled {
+		// Check if caching is enabled and this is a POST request
+		if lb.cacheEnabled && r.Method == http.MethodPost {
+			// Read the request body
+			bodyBytes, err := io.ReadAll(r.Body)
+			if err != nil {
+				http.Error(w, "Error reading request body", http.StatusBadRequest)
+				log.Printf("Error reading request body: %v", err)
+				return
+			}
+
+			// Restore the body for later use
+			r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+
+			// Try to extract the data and operation fields to use as cache key
+			var requestData map[string]interface{}
+			if err := json.Unmarshal(bodyBytes, &requestData); err == nil {
+				// Check if we have at least the data field
+				if _, hasData := requestData["data"]; hasData {
+					// Create cache keys using both data and operation fields
+					cacheKey, pendingCacheKey, err := getCacheKeyFromRequest(requestData)
+					if err != nil {
+						log.Printf("Error creating cache key: %v", err)
+						lb.handleProxy(w, r) // Fall back to normal proxy
+						return
+					}
+
+					// Log the cache key components for debugging
+					operation := "none"
+					if op, hasOp := requestData["operation"]; hasOp {
+						operation = fmt.Sprintf("%v", op)
+					}
+					log.Printf("Cache key created with operation: %s", operation)
+
+					// Check if we have a cached response
+					cachedResponse, err := lb.redisClient.Get(ctx, cacheKey).Bytes()
+					if err == nil && len(cachedResponse) > 0 {
+						// We have a cached response, return it
+						log.Printf("Cache hit for key: %s", cacheKey)
+						w.Header().Set("Content-Type", "application/json")
+						w.Header().Set("X-Cache", "HIT")
+						w.Write(cachedResponse)
+						return
+					}
+
+					// Check if this request is already being processed
+					pendingExists, err := lb.redisClient.Exists(ctx, pendingCacheKey).Result()
+					if err == nil && pendingExists > 0 {
+						// This request is already being processed - we have a duplicate request
+						log.Printf("Request for same data+operation is already pending, extending TTL")
+
+						// Since this is a duplicate request for the same data, extend the TTL of the pending key
+						err := lb.redisClient.Expire(ctx, pendingCacheKey, lb.cacheExpiration).Err()
+						if err != nil {
+							log.Printf("Error refreshing pending cache TTL: %v", err)
+						} else {
+							log.Printf("Refreshed TTL for pending key: %s", pendingCacheKey)
+						}
+
+						// Set up a timeout context for the wait
+						waitCtx, cancel := context.WithTimeout(ctx, maxWaitTime)
+						defer cancel()
+
+						// Set up a ticker to periodically check for the real response
+						ticker := time.NewTicker(cacheCheckInterval)
+						defer ticker.Stop()
+
+						// Wait for either the real response or timeout
+						for {
+							select {
+							case <-ticker.C:
+								// Check if the real response is now available
+								cachedResponse, err := lb.redisClient.Get(waitCtx, cacheKey).Bytes()
+								if err == nil && len(cachedResponse) > 0 {
+									// We have a real response now, return it
+									log.Printf("Found cached response while waiting")
+									w.Header().Set("Content-Type", "application/json")
+									w.Header().Set("X-Cache", "WAIT-HIT")
+									w.Write(cachedResponse)
+									return
+								}
+
+								// Check if the pending key still exists
+								pendingExists, err := lb.redisClient.Exists(waitCtx, pendingCacheKey).Result()
+								if err != nil || pendingExists == 0 {
+									// The pending key is gone but no real response is available
+									// This is an error condition - the original request failed
+									log.Printf("Pending key disappeared without a real response")
+									http.Error(w, "Request processing failed", http.StatusInternalServerError)
+									return
+								}
+
+							case <-waitCtx.Done():
+								// We've waited too long, give up
+								log.Printf("Timeout waiting for real response after %v", maxWaitTime)
+								http.Error(w, "Timeout waiting for response", http.StatusGatewayTimeout)
+								return
+
+							case <-r.Context().Done():
+								// The client disconnected
+								log.Printf("Client disconnected while waiting for response")
+								return
+							}
+						}
+					}
+
+					// This is a new request, store a placeholder in Redis
+					log.Printf("Setting pending cache key: %s", pendingCacheKey)
+					err = lb.redisClient.Set(ctx, pendingCacheKey, []byte(placeholderResponse), lb.cacheExpiration).Err()
+					if err != nil {
+						log.Printf("Error setting pending cache: %v", err)
+						// Continue with proxy even if caching fails
+					}
+
+					// Create a response capturer to update the cache with the real response
+					responseCapture := &responseCapturer{
+						ResponseWriter:  w,
+						cacheKey:        cacheKey,
+						pendingCacheKey: pendingCacheKey,
+						lb:              lb,
+						ctx:             ctx,
+					}
+
+					// Continue with normal proxy handling but use our capturing writer
+					log.Printf("Proceeding with proxy using response capturer")
+					lb.handleProxy(responseCapture, r)
+					return
+				}
+			}
+
+			// Restore the body again if we couldn't use caching
+			r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+		}
+	}
+
+	// Handle the proxy request
+	lb.handleProxy(w, r)
 }
 
 func (lb *LoadBalancer) handleProxy(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "Error reading request body", http.StatusBadRequest)
+		log.Printf("Error reading request body: %v", err)
+		return
+	}
+
+	// Restore the body for later use
+	r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+
+	// Try to parse as ZKProverPayload
+	var payload ZKProverPayload
+	var isProve bool
+
+	if err := json.Unmarshal(bodyBytes, &payload); err == nil {
+		isProve = payload.Operation == "prove"
+	}
+
 	// Keep track of the last error
 	var lastErr error
+
 	var currentIP string
 
 	// Make sure we always release any IP we've acquired
@@ -636,7 +699,7 @@ func (lb *LoadBalancer) handleProxy(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// Get the next available IP, waiting if necessary
-		ip, err := lb.waitForAvailableIP(ctx)
+		ip, err := lb.waitForAvailableIP(ctx, isProve)
 		if err != nil {
 			http.Error(w, "Failed to get available server: "+err.Error(), http.StatusServiceUnavailable)
 			log.Printf("Error waiting for available IP: %v", err)
@@ -648,7 +711,10 @@ func (lb *LoadBalancer) handleProxy(w http.ResponseWriter, r *http.Request) {
 		log.Printf("Attempting to proxy request to IP: %s", ip)
 
 		// Create a URL from the IP
-		targetURL, err := url.Parse("http://" + ip + ":3001")
+		// Split IP into base IP and type (prove/verify)
+		parts := strings.Split(ip, ":")
+		baseIP := parts[0]
+		targetURL, err := url.Parse("http://" + baseIP + ":3001")
 		log.Printf("targetURL: %s", targetURL)
 		if err != nil {
 			lb.releaseIP(ctx, ip)
