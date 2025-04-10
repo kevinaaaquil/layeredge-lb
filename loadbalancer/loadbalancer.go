@@ -363,7 +363,7 @@ func getCacheKeyFromRequest(requestData map[string]interface{}) (string, string,
 
 // sendWebhook sends a notification to the webhook URL
 func (lb *LoadBalancer) sendWebhook(ip string, errMsg string) {
-	webhookURL := "https://hooks.slack.com/services/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" // Webhook URL
+	webhookURL := "" // Webhook URL
 
 	// Create the payload
 	payload := WebhookPayload{
